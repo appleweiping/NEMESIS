@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import shutil
@@ -184,36 +185,56 @@ class DriverPreflightTests(unittest.TestCase):
     )
     def test_invalid_lut_fails_before_existing_work_dir_is_deleted(self):
         script_path = Path(__file__).parents[1] / "llm_aided_modelling.sh"
+        cases = [
+            (None, "cannot read LUT CSV"),
+            ("", "cannot read LUT CSV"),
+            ("L,gmid,id\n1.8e-7,10,5e-6\n", "missing required columns: W"),
+            ("L,gmid,id,W\n", "contains no data rows"),
+            ("L,gmid,id,W\n1.8e-7,not-a-number,5e-6,1e-6\n",
+             "finite numeric values in columns: gmid"),
+        ]
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
-            sentinel_path = temp_path / "5t_ota" / "keep.txt"
-            nmos_path = temp_path / "valid NMOS LUT.csv"
-            pmos_path = temp_path / "invalid PMOS LUT.csv"
-            sentinel_path.parent.mkdir()
-            sentinel_path.write_text("keep", encoding="utf-8")
-            nmos_path.write_text(VALID_LUT, encoding="utf-8")
-            pmos_path.write_text(
-                "L,gmid,id,W\n1.8e-7,not-a-number,5e-6,1e-6\n",
-                encoding="utf-8",
-            )
+        for invalid_device in ("NMOS", "PMOS"):
+            for content, error in cases:
+                with self.subTest(device=invalid_device, error=error, content=content):
+                    with tempfile.TemporaryDirectory() as temp_dir:
+                        temp_path = Path(temp_dir)
+                        sentinel_path = temp_path / "5t_ota" / "keep.txt"
+                        sentinel_path.parent.mkdir()
+                        sentinel_path.write_text("keep this content", encoding="utf-8")
+                        paths = {}
+                        for device in ("NMOS", "PMOS"):
+                            paths[device] = temp_path / f"{device} LUT.csv"
+                            value = content if device == invalid_device else VALID_LUT
+                            if value is not None:
+                                paths[device].write_text(value, encoding="utf-8")
 
-            env = os.environ.copy()
-            env["NMOS_LUT_FILE"] = str(nmos_path)
-            env["PMOS_LUT_FILE"] = str(pmos_path)
-            result = subprocess.run(
-                ["bash", str(script_path)],
-                cwd=temp_path,
-                env=env,
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=15,
-            )
+                        def snapshot():
+                            return {
+                                str(path.relative_to(temp_path)):
+                                hashlib.sha256(path.read_bytes()).hexdigest()
+                                for path in temp_path.rglob("*") if path.is_file()
+                            }
 
-            self.assertEqual(result.returncode, 2)
-            self.assertIn("finite numeric values in columns: gmid", result.stderr)
-            self.assertTrue(sentinel_path.exists())
+                        before = snapshot()
+                        env = os.environ.copy()
+                        env["NMOS_LUT_FILE"] = str(paths["NMOS"])
+                        env["PMOS_LUT_FILE"] = str(paths["PMOS"])
+                        result = subprocess.run(
+                            ["bash", str(script_path)],
+                            cwd=temp_path,
+                            env=env,
+                            capture_output=True,
+                            text=True,
+                            check=False,
+                            timeout=15,
+                        )
+
+                        self.assertEqual(result.returncode, 2, result.stderr)
+                        self.assertIn(error, result.stderr)
+                        self.assertEqual(snapshot(), before)
+                        self.assertNotIn("[INFO] Creating work directory", result.stdout)
+                        self.assertNotIn("Running gm/Id", result.stdout)
 
 
 if __name__ == "__main__":
